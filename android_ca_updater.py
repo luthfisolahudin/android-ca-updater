@@ -55,6 +55,13 @@ DEFAULT_HOSTS = (
 OK_LABELS = ("ok", "oke", "simpan", "save", "确定", "aceptar")
 
 PEM_BLOCK = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+CERTDATA_HEADER = re.compile(r'^# (Certificate|Trust for Certificate|Trust for) "(.*)"$')
+OCTAL_ESCAPE = re.compile(r"\\([0-7]{1,3})")
+CERTDATA_URL = (
+    "https://raw.githubusercontent.com/mozilla/gecko-dev/master/"
+    "security/nss/lib/ckfw/builtins/certdata.txt"
+)
+TRUSTED_FOR_TLS = "CKT_NSS_TRUSTED_DELEGATOR"
 
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "android-ca-updater"
 STATE_FILE = (
@@ -404,6 +411,209 @@ def fetch_bundle(
 
 
 
+# ------------------------------------------------------------------- mozilla store
+
+
+@dataclass(frozen=True)
+class CertRecord:
+    label: str
+    server_auth: str | None
+    distrust_after: datetime | None
+    not_after: datetime | None
+
+
+def certdata_octal(lines: list[str]) -> bytes:
+    decoded = "".join(
+        OCTAL_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), line) for line in lines
+    )
+    return decoded.strip().encode("latin-1")
+
+
+def certdata_attribute(block: dict, name: str) -> str | None:
+    lines = block["lines"]
+    for index, line in enumerate(lines):
+        if not line.startswith(name):
+            continue
+        if "MULTILINE_OCTAL" not in line:
+            return line.split()[-1]
+        buffer = []
+        for follower in lines[index + 1 :]:
+            if follower.strip() == "END":
+                break
+            buffer.append(follower)
+        return certdata_octal(buffer).decode("latin-1")
+    return None
+
+
+def certdata_sha1(block: dict) -> str | None:
+    for line in block["lines"]:
+        match = re.match(r"# Fingerprint \(SHA1\): (.+)$", line)
+        if match:
+            return match.group(1).replace(":", "").lower()
+    raw = certdata_attribute(block, "CKA_CERT_SHA1_HASH")
+    return raw.encode("latin-1").hex() if raw else None
+
+
+def parse_certdata_date(raw: str | None) -> datetime | None:
+    if not raw or not raw.endswith("Z"):
+        return None
+    try:
+        if len(raw) == 13:
+            return datetime.strptime(raw, "%y%m%d%H%M%SZ").replace(tzinfo=timezone.utc)
+        if len(raw) == 15:
+            return datetime.strptime(raw, "%Y%m%d%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return None
+
+
+def parse_not_after(block: dict) -> datetime | None:
+    for line in block["lines"]:
+        match = re.match(r"# Not Valid After\s*:\s*(.+)$", line)
+        if not match:
+            continue
+        try:
+            return datetime.strptime(
+                re.sub(r"\s+", " ", match.group(1).strip()), "%a %b %d %H:%M:%S %Y"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def decode_label(value: str) -> str:
+    def replace(match: re.Match) -> str:
+        return chr(int(match.group(1), 16))
+
+    decoded = re.sub(r"\\([0-9A-Fa-f]{2})", replace, value)
+    return decoded.encode("latin-1", "replace").decode("utf-8", "replace")
+
+
+def parse_certdata_records(text: str) -> dict[str, CertRecord]:
+    blocks: list[dict] = []
+    current: dict | None = None
+    for line in text.splitlines():
+        match = CERTDATA_HEADER.match(line)
+        if match:
+            if current is not None:
+                blocks.append(current)
+            current = {"kind": match.group(1), "label": decode_label(match.group(2)), "lines": []}
+        elif current is not None:
+            current["lines"].append(line)
+    if current is not None:
+        blocks.append(current)
+
+    found: dict[str, dict] = {}
+    for block in blocks:
+        fingerprint = certdata_sha1(block)
+        if not fingerprint:
+            continue
+        record = found.setdefault(
+            fingerprint,
+            {
+                "label": block["label"],
+                "server_auth": None,
+                "distrust_after": None,
+                "not_after": parse_not_after(block),
+            },
+        )
+        if block["kind"] == "Certificate":
+            record["distrust_after"] = parse_certdata_date(
+                certdata_attribute(block, "CKA_NSS_SERVER_DISTRUST_AFTER")
+            )
+        else:
+            record["server_auth"] = certdata_attribute(block, "CKA_TRUST_SERVER_AUTH")
+    return {key: CertRecord(**value) for key, value in found.items()}
+
+
+def parse_certdata(text: str) -> dict[str, CertRecord]:
+    records = parse_certdata_records(text)
+    if len(records) < 50:
+        raise ToolError(f"certdata looks truncated ({len(records)} entries)")
+    return records
+
+
+def fetch_certdata(
+    refresh: bool = False,
+    quiet: bool = False,
+    max_age: timedelta = BUNDLE_MAX_AGE,
+) -> dict[str, CertRecord]:
+    path = CACHE_DIR / "certdata.txt"
+    meta_path = CACHE_DIR / "certdata.json"
+    meta: dict = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            meta = {}
+
+    cached_at = parse_timestamp(meta.get("fetched_at"))
+    fresh = cached_at is not None and datetime.now(timezone.utc) - cached_at < max_age
+    if refresh or not fresh or not path.exists():
+        try:
+            body, headers = http_get(CERTDATA_URL, meta.get("etag"), meta.get("last_modified"))
+        except (OSError, urllib.error.URLError) as exc:
+            if not path.exists():
+                raise ToolError(f"cannot download certdata: {exc}") from exc
+            if not quiet:
+                print(f"warning: using cached certdata ({exc})", file=sys.stderr)
+        else:
+            text = body.decode("utf-8", "replace") if body is not None else path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+            try:
+                parse_certdata(text)
+            except ToolError as exc:
+                if not quiet:
+                    print(f"warning: rejected certdata download: {exc}", file=sys.stderr)
+            else:
+                if body is not None:
+                    write_atomic(path, text)
+                meta = {
+                    "source": "mozilla-gecko-dev",
+                    "url": CERTDATA_URL,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "etag": headers.get("ETag"),
+                    "last_modified": headers.get("Last-Modified"),
+                    "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                }
+                write_atomic(meta_path, json.dumps(meta, indent=2))
+                if not quiet and body is not None:
+                    print("Mozilla certdata updated")
+
+    if not path.exists():
+        raise ToolError("cannot obtain Mozilla certdata and no cached copy exists")
+    return parse_certdata(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def classify_root(cert: Cert, records: dict[str, CertRecord], now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    record = records.get(hashlib.sha1(cert.der).hexdigest())
+    if record is None:
+        return "expired" if cert.not_after <= now else "removed"
+    if record.server_auth != TRUSTED_FOR_TLS:
+        return "distrusted"
+    if record.distrust_after is not None and record.distrust_after <= now:
+        return "distrusted"
+    if cert.not_after <= now:
+        return "expired"
+    return "fine"
+
+
+def classify_fingerprint(sha1: str, records: dict[str, CertRecord], now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    record = records.get(sha1)
+    if record is None:
+        return "removed"
+    if record.server_auth != TRUSTED_FOR_TLS:
+        return "distrusted"
+    if record.distrust_after is not None and record.distrust_after <= now:
+        return "distrusted"
+    if record.not_after is not None and record.not_after <= now:
+        return "expired"
+    return "fine"
+
+
 # --------------------------------------------------------------------------- chains
 
 
@@ -658,16 +868,63 @@ def save_state(state: dict) -> None:
     write_atomic(STATE_FILE, json.dumps(state, indent=2))
 
 
-def tracked_roots(serial: str) -> dict[str, str]:
+def tracked_roots(serial: str) -> dict[str, dict]:
     entry = load_state().get("devices", {}).get(serial, {})
-    return entry.get("installed", {})
+    installed = entry.get("installed", {})
+    tracked: dict[str, dict] = {}
+    for fingerprint, value in installed.items():
+        if isinstance(value, str):
+            tracked[fingerprint] = {"name": value, "sha1": None}
+        else:
+            tracked[fingerprint] = value
+    return tracked
 
 
 def track_root(serial: str, cert: Cert, name: str) -> None:
     state = load_state()
     devices = state.setdefault("devices", {})
     entry = devices.setdefault(serial, {"installed": {}})
-    entry["installed"][cert.fingerprint] = name
+    entry["installed"][cert.fingerprint] = {
+        "name": name,
+        "sha1": hashlib.sha1(cert.der).hexdigest(),
+    }
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    save_state(state)
+
+
+def backfill_tracked_sha1(serial: str, tracked: dict[str, dict]) -> None:
+    missing = [fingerprint for fingerprint, info in tracked.items() if not info.get("sha1")]
+    if not missing:
+        return
+    try:
+        certs = fetch_bundle(quiet=True).certs
+    except ToolError:
+        return
+    by_fingerprint = {cert.fingerprint: cert for cert in certs}
+    updated = False
+    for fingerprint in missing:
+        cert = by_fingerprint.get(fingerprint)
+        if cert is None:
+            continue
+        tracked[fingerprint]["sha1"] = hashlib.sha1(cert.der).hexdigest()
+        updated = True
+    if not updated:
+        return
+    state = load_state()
+    entry = state.setdefault("devices", {}).setdefault(serial, {"installed": {}})
+    installed = entry.setdefault("installed", {})
+    for fingerprint, info in tracked.items():
+        installed[fingerprint] = {"name": info.get("name"), "sha1": info.get("sha1")}
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    save_state(state)
+
+
+def untrack_root(serial: str, fingerprint: str) -> None:
+    state = load_state()
+    entry = state.get("devices", {}).get(serial)
+    if not entry:
+        return
+    entry.get("installed", {}).pop(fingerprint, None)
     entry["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     save_state(state)
 
@@ -1022,6 +1279,26 @@ def cmd_fix(args) -> int:
         print(Paint.ok("nothing to install"))
         return 0
 
+    try:
+        records = fetch_certdata(
+            refresh=args.refresh, quiet=True, max_age=timedelta(days=args.max_age_days)
+        )
+    except ToolError:
+        records = {}
+    if records:
+        blocked = {
+            fingerprint: cert
+            for fingerprint, cert in targets.items()
+            if classify_fingerprint(hashlib.sha1(cert.der).hexdigest(), records) == "distrusted"
+        }
+        for fingerprint in blocked:
+            targets.pop(fingerprint)
+        if blocked:
+            names = ", ".join(sorted(cert.common_name for cert in blocked.values()))
+            print(Paint.warn(f"refusing to install distrusted root(s): {names}"))
+        if not targets:
+            return 1
+
     ordered = sorted(targets.values(), key=lambda cert: cert.common_name)
     print(f"{len(ordered)} root(s) to install:")
     for cert in ordered:
@@ -1085,6 +1362,234 @@ def cmd_verify(args) -> int:
     return 0
 
 
+CREDENTIAL_ACTIVITY = "com.android.settings/.TrustedCredentialsSettings"
+SECURITY_SETTINGS_ACTION = "android.settings.SECURITY_SETTINGS"
+CREDENTIAL_LABELS = (
+    "trusted credentials",
+    "kredensial tepercaya",
+    "sertifikat tepercaya",
+    "credential storage",
+    "penyimpanan kredensial",
+    "certificates",
+    "sertifikat",
+)
+REMOVE_LABELS = ("remove", "uninstall", "hapus", "delete")
+
+
+def find_node_by_text(root: ET.Element | None, needles: tuple[str, ...]) -> ET.Element | None:
+    if root is None:
+        return None
+    for node in root.iter("node"):
+        text = (node.get("text") or "").strip().lower()
+        if text and any(needle in text for needle in needles):
+            return node
+    return None
+
+
+def tap_node(dev: Device, node: ET.Element | None, what: str) -> None:
+    if node is None:
+        raise ToolError(f"cannot find {what} on screen")
+    center = node_bounds(node)
+    if center is None:
+        raise ToolError(f"cannot locate {what} bounds")
+    dev.shell(f"input tap {center[0]} {center[1]}")
+
+
+def open_credential_manager(dev: Device) -> None:
+    started = dev.shell(f"am start -n {CREDENTIAL_ACTIVITY}")
+    if "does not exist" not in started and "Error" not in started:
+        if wait_for(lambda: "com.android.settings" in current_focus(dev), timeout=10):
+            return
+    dev.shell(f"am start -a {SECURITY_SETTINGS_ACTION}")
+    if not wait_for(lambda: "settings" in current_focus(dev), timeout=10):
+        raise ToolError("cannot open Android security settings")
+    entry = find_node_by_text(ui_dump(dev), CREDENTIAL_LABELS)
+    if entry is None:
+        raise ToolError(
+            "this ROM does not expose a trusted-credentials screen; remove the CA manually "
+            "from Settings > Security > Trusted credentials"
+        )
+    tap_node(dev, entry, "the trusted credentials entry")
+    time.sleep(1.2)
+
+
+def remove_user_ca(dev: Device, name: str) -> None:
+    dev.ensure_unlocked()
+    open_credential_manager(dev)
+
+    target = find_node_by_text(ui_dump(dev), (name.lower(),))
+    if target is None:
+        raise ToolError(f"certificate {name!r} is not listed")
+    tap_node(dev, target, f"certificate {name!r}")
+    time.sleep(1.0)
+
+    confirm = find_node(ui_dump(dev), class_name="Button", labels=REMOVE_LABELS)
+    if confirm is None:
+        raise ToolError("cannot find the remove action for this certificate")
+    tap_node(dev, confirm, "the remove button")
+    time.sleep(1.0)
+
+    final = find_node(ui_dump(dev), class_name="Button", labels=OK_LABELS + REMOVE_LABELS)
+    if final is not None:
+        tap_node(dev, final, "the confirmation button")
+        time.sleep(1.0)
+
+    if find_node_by_text(ui_dump(dev), (name.lower(),)) is not None:
+        raise ToolError(f"certificate {name!r} is still listed after removal")
+
+
+def cmd_audit(args) -> int:
+    adb = find_adb()
+    dev = pick_device(adb, args.serial)
+    store = load_system_store(dev)
+    records = fetch_certdata(refresh=args.refresh, max_age=timedelta(days=args.max_age_days))
+    tracked = tracked_roots(dev.serial)
+    backfill_tracked_sha1(dev.serial, tracked)
+    now = datetime.now(timezone.utc)
+
+    print_device(dev, store, tracked)
+    print(f"mozilla     {len(records)} roots in certdata (trust bits + distrust dates)")
+    print()
+
+    if store is None:
+        print(Paint.warn("cannot read the system trust store on this device"))
+        return 1
+
+    buckets = {"fine": 0, "expired": 0, "distrusted": 0, "removed": 0}
+    findings: dict[str, list[tuple[str, str]]] = {"distrusted": [], "removed": [], "expired": []}
+    for cert in store.by_fingerprint.values():
+        kind = classify_root(cert, records, now)
+        buckets[kind] += 1
+        if kind == "fine":
+            continue
+        record = records.get(hashlib.sha1(cert.der).hexdigest())
+        reason = ""
+        if kind == "distrusted" and record is not None:
+            if record.distrust_after is not None:
+                reason = f"distrust after {record.distrust_after.date()}"
+            elif record.server_auth != TRUSTED_FOR_TLS:
+                reason = f"server auth {record.server_auth}"
+        findings[kind].append((cert.common_name, reason))
+
+    print(
+        f"system CAs  {len(store)} roots | {buckets['fine']} fine | "
+        f"{buckets['distrusted']} distrusted | {buckets['removed']} removed | "
+        f"{buckets['expired']} expired"
+    )
+    print()
+
+    titles = {
+        "distrusted": "not trusted for TLS by Mozilla - highest risk",
+        "removed": "no longer in Mozilla's root program",
+        "expired": "expired - the certificate itself is inert",
+    }
+    for kind in ("distrusted", "removed", "expired"):
+        items = sorted(findings[kind])
+        if not items:
+            continue
+        print(f"{kind.upper()}  {len(items)} root(s) - {titles[kind]}")
+        shown = items if args.all else items[: args.limit]
+        for name, reason in shown:
+            suffix = f"  {Paint.dim(reason)}" if reason else ""
+            print(f"  - {name}{suffix}")
+        if not args.all and len(items) > args.limit:
+            print(Paint.dim(f"  ... {len(items) - args.limit} more (use --all)"))
+        print()
+
+    stale: list[tuple[str, str]] = []
+    for fingerprint, info in tracked.items():
+        sha1 = info.get("sha1")
+        kind = classify_fingerprint(sha1, records, now) if sha1 else "unknown"
+        if kind != "fine":
+            stale.append((info.get("name") or fingerprint[:12], kind))
+    if tracked:
+        print(f"user CAs    {len(tracked)} root(s) installed by this tool")
+        for name, kind in sorted(stale):
+            print(f"  - {name}  {Paint.warn(kind)}")
+        if stale:
+            print("  run: android-ca-updater revoke --stale")
+        print()
+
+    if buckets["distrusted"] or buckets["removed"]:
+        print(Paint.warn("system roots cannot be removed from adb on a user build"))
+        print(
+            Paint.dim(
+                "they live in /system (read-only, dm-verity) and need root to delete or mask"
+            )
+        )
+        print(Paint.dim("options: a rooted device, a maintained custom ROM, or a supported phone"))
+    return 0
+
+
+def cmd_revoke(args) -> int:
+    adb = find_adb()
+    dev = pick_device(adb, args.serial)
+    tracked = tracked_roots(dev.serial)
+    if not tracked:
+        print("nothing installed by this tool")
+        return 0
+    backfill_tracked_sha1(dev.serial, tracked)
+
+    records = fetch_certdata(refresh=args.refresh, max_age=timedelta(days=args.max_age_days))
+    now = datetime.now(timezone.utc)
+
+    if args.stale:
+        targets = [
+            (fingerprint, info)
+            for fingerprint, info in tracked.items()
+            if info.get("sha1") and classify_fingerprint(info["sha1"], records, now) != "fine"
+        ]
+    elif args.name:
+        wanted = [value.lower() for value in args.name]
+        targets = [
+            (fingerprint, info)
+            for fingerprint, info in tracked.items()
+            if any(value in (info.get("name") or "").lower() for value in wanted)
+        ]
+    else:
+        raise ToolError("pass --name TEXT or --stale")
+
+    if not targets:
+        print(Paint.ok("nothing to revoke"))
+        return 0
+
+    print(f"{len(targets)} user CA(s) to remove:")
+    for _, info in targets:
+        print(f"  - {info.get('name')}")
+    print()
+
+    if not args.yes and not args.dry_run:
+        if not sys.stdin.isatty():
+            raise ToolError("refusing to remove without confirmation; pass --yes")
+        answer = input("remove these user CAs from the device? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("aborted")
+            return 1
+
+    if args.dry_run:
+        print("dry run: no changes made")
+        return 0
+
+    failures = 0
+    for fingerprint, info in targets:
+        name = info.get("name") or fingerprint[:12]
+        try:
+            remove_user_ca(dev, name)
+            untrack_root(dev.serial, fingerprint)
+            print(f"  {Paint.ok('removed')} {name}")
+        except NeedsUnlock:
+            raise
+        except ToolError as exc:
+            failures += 1
+            print(f"  {Paint.bad('failed')}  {name}: {exc}")
+
+    print()
+    if failures:
+        return 1
+    print(Paint.ok("done"))
+    return 0
+
+
 def cmd_list(args) -> int:
     adb = find_adb()
     dev = pick_device(adb, args.serial)
@@ -1121,6 +1626,8 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  android-ca-updater doctor\n"
             "  android-ca-updater fix --yes\n"
+            "  android-ca-updater audit --all\n"
+            "  android-ca-updater revoke --stale\n"
             "  android-ca-updater doctor --hosts my-sites.txt\n"
             "  android-ca-updater verify\n"
         ),
@@ -1182,6 +1689,22 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(verify)
     verify.add_argument("--wait", type=float, default=4.0, help="seconds to wait per host (default 4)")
     verify.set_defaults(func=cmd_verify)
+
+    audit = subparsers.add_parser(
+        "audit", help="list expired, distrusted and removed roots in the device trust store"
+    )
+    add_common(audit)
+    audit.add_argument("--all", action="store_true", help="print every finding")
+    audit.add_argument("--limit", type=int, default=10, help="findings per category (default 10)")
+    audit.set_defaults(func=cmd_audit)
+
+    revoke = subparsers.add_parser("revoke", help="remove user CAs installed by this tool")
+    add_common(revoke)
+    revoke.add_argument("--name", nargs="+", help="certificate name substring(s) to remove")
+    revoke.add_argument("--stale", action="store_true", help="remove roots now distrusted/expired/removed")
+    revoke.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    revoke.add_argument("--dry-run", action="store_true", help="show what would be removed")
+    revoke.set_defaults(func=cmd_revoke)
 
     listing = subparsers.add_parser("list", help="list CA bundle roots and their status on the device")
     add_common(listing)

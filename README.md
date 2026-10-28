@@ -74,6 +74,57 @@ Guarantees enforced in code:
 The tool never edits `/system`. Roots are installed as *user* CAs through the
 platform installer, so they are always removable from Settings.
 
+## Auditing and revoking
+
+A frozen trust store is not only *missing* new roots — it also still trusts old
+ones that the ecosystem has withdrawn. `audit` classifies every root on the
+device against **Mozilla's `certdata.txt`**, which carries the authoritative
+trust bits and `CKA_NSS_SERVER_DISTRUST_AFTER` dates:
+
+```bash
+android-ca-updater audit
+android-ca-updater audit --all          # print every finding
+```
+
+```
+system CAs  158 roots | 49 fine | 18 distrusted | 44 removed | 47 expired
+
+DISTRUSTED  18 root(s) - not trusted for TLS by Mozilla - highest risk
+  - AffirmTrust Commercial  distrust after 2024-11-30
+  - Entrust Root Certification Authority - G2  distrust after 2024-11-30
+  ...
+```
+
+Categories:
+
+| Category | Meaning |
+| --- | --- |
+| `distrusted` | Mozilla does not trust this root for TLS: either the trust bit is not `CKT_NSS_TRUSTED_DELEGATOR` or its `distrust after` date has passed |
+| `removed` | The root is gone from Mozilla's program entirely (retired, replaced, or removed for cause) |
+| `expired` | The certificate's `notAfter` has passed; it is inert but still shipped |
+
+Two hard limits, stated plainly:
+
+- **System roots cannot be removed over adb on a user build.** They live in
+  `/system/etc/security/cacerts` (read-only, dm-verity) and Android's
+  `cacerts-removed` directory is root-only. `audit` reports them; removing them
+  needs root, a custom ROM, or a supported device.
+- **Only user CAs can be revoked.** `revoke` removes the roots this tool
+  installed, through the device's own trusted-credentials screen:
+
+```bash
+android-ca-updater revoke --stale            # roots now distrusted/expired/removed
+android-ca-updater revoke --name ISRG        # match by name
+android-ca-updater revoke --stale --dry-run
+```
+
+`revoke` needs the ROM to expose a trusted-credentials screen
+(`com.android.settings/.TrustedCredentialsSettings`, or Settings > Security). If
+it cannot find one, it stops and prints the manual path instead of guessing.
+
+`fix` also refuses to install anything that is not a self-signed root from the
+current bundle, so a compromised or injected entry never reaches the device.
+
 ## Requirements
 
 - `python3` (3.9+), no third-party packages
@@ -103,6 +154,8 @@ android-ca-updater doctor --browser       # also confirm in Chrome via logcat
 android-ca-updater fix                    # install the missing roots
 android-ca-updater fix --dry-run          # show what would be installed
 android-ca-updater verify                 # re-check hosts in Chrome
+android-ca-updater audit                  # expired / distrusted / removed roots on the device
+android-ca-updater revoke --stale         # remove user CAs this tool installed
 android-ca-updater list                   # every bundle root and its status
 ```
 

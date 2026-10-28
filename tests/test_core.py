@@ -130,6 +130,90 @@ class BundleTrustTests(unittest.TestCase):
         self.assertEqual([problem for problem in problems if "at least" not in problem], [])
 
 
+def octal(value: bytes) -> str:
+    lines = []
+    for index in range(0, len(value), 16):
+        lines.append("".join("\\%03o" % byte for byte in value[index : index + 16]))
+    return "\n".join(lines)
+
+
+CERTDATA_SAMPLE = f"""# Certificate "Test Trusted Root"
+# Not Valid After : Mon Nov 10 00:00:00 2031
+# Fingerprint (SHA1): AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA
+CKA_NSS_SERVER_DISTRUST_AFTER MULTILINE_OCTAL
+{octal(b"241130235959Z")}
+END
+
+# Trust for "Test Trusted Root"
+CKA_CERT_SHA1_HASH MULTILINE_OCTAL
+{octal(bytes.fromhex("aa" * 20))}
+END
+CKA_TRUST_SERVER_AUTH CK_TRUST CKT_NSS_TRUSTED_DELEGATOR
+
+# Certificate "Test Distrusted Root"
+# Not Valid After : Mon Nov 10 00:00:00 2031
+# Fingerprint (SHA1): BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB
+
+# Trust for "Test Distrusted Root"
+CKA_CERT_SHA1_HASH MULTILINE_OCTAL
+{octal(bytes.fromhex("bb" * 20))}
+END
+CKA_TRUST_SERVER_AUTH CK_TRUST CKT_NSS_NOT_TRUSTED
+"""
+
+
+class CertdataTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.records = cli.parse_certdata_records(CERTDATA_SAMPLE)
+
+    def test_parses_both_entries(self) -> None:
+        self.assertEqual(len(self.records), 2)
+
+    def test_reads_trust_bits(self) -> None:
+        self.assertEqual(
+            self.records["aa" * 20].server_auth, cli.TRUSTED_FOR_TLS
+        )
+        self.assertEqual(self.records["bb" * 20].server_auth, "CKT_NSS_NOT_TRUSTED")
+
+    def test_reads_distrust_date(self) -> None:
+        self.assertEqual(
+            self.records["aa" * 20].distrust_after,
+            cli.datetime(2024, 11, 30, 23, 59, 59, tzinfo=cli.timezone.utc),
+        )
+
+    def test_reads_validity(self) -> None:
+        self.assertEqual(self.records["aa" * 20].not_after.year, 2031)
+
+    def test_truncated_certdata_is_rejected(self) -> None:
+        with self.assertRaises(cli.ToolError):
+            cli.parse_certdata(CERTDATA_SAMPLE)
+
+    def test_decode_label_handles_hex_escapes(self) -> None:
+        self.assertEqual(cli.decode_label(r"Autorit\C3\A9"), "Autorité")
+
+    def test_classifies_missing_fingerprint_as_removed(self) -> None:
+        self.assertEqual(cli.classify_fingerprint("cc" * 20, self.records), "removed")
+
+    def test_classifies_not_trusted_as_distrusted(self) -> None:
+        self.assertEqual(cli.classify_fingerprint("bb" * 20, self.records), "distrusted")
+
+    def test_classifies_passed_distrust_date_as_distrusted(self) -> None:
+        self.assertEqual(cli.classify_fingerprint("aa" * 20, self.records), "distrusted")
+
+    def test_classifies_trusted_without_distrust_as_fine(self) -> None:
+        record = cli.CertRecord(
+            label="ok", server_auth=cli.TRUSTED_FOR_TLS, distrust_after=None, not_after=None
+        )
+        self.assertEqual(cli.classify_fingerprint("aa" * 20, {"aa" * 20: record}), "fine")
+
+    def test_classifies_trusted_expired_as_expired(self) -> None:
+        past = cli.datetime(2001, 1, 1, tzinfo=cli.timezone.utc)
+        record = cli.CertRecord(
+            label="old", server_auth=cli.TRUSTED_FOR_TLS, distrust_after=None, not_after=past
+        )
+        self.assertEqual(cli.classify_fingerprint("aa" * 20, {"aa" * 20: record}), "expired")
+
+
 class UiParsingTests(unittest.TestCase):
     XML = (
         '<hierarchy><node class="android.widget.LinearLayout" bounds="[0,0][540,960]">'
