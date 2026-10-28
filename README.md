@@ -36,6 +36,44 @@ device actually needs — usually one to three roots.
 Nothing outside the Mozilla/CCADB bundle is ever installable — the tool will not
 add arbitrary or self-signed certificates.
 
+## Where the CAs come from
+
+The bundle is *Mozilla's* trust store, not a list maintained by this project:
+
+| Order | Source | What it is |
+| --- | --- | --- |
+| 1 | `https://curl.se/ca/cacert.pem` | Mozilla NSS `certdata.txt`, published by the curl project |
+| 2 | `https://raw.githubusercontent.com/certifi/python-certifi/master/certifi/cacert.pem` | The same Mozilla data, published by python-certifi |
+
+Guarantees enforced in code:
+
+- **HTTPS only, hostname allowlisted.** `assert_trusted_url()` rejects any
+  other scheme or host, so a tampered `CA_SOURCES` entry cannot downgrade to
+  plain HTTP or an arbitrary mirror.
+- **Every download is validated before use.** A bundle is rejected unless it
+  contains at least 50 roots, every entry is a self-signed root (subject ==
+  issuer), there are no duplicates, and no root is expired. A rejected bundle
+  never replaces the last valid cached copy.
+- **Only self-signed roots can be installed.** `install_root()` refuses
+  anything else, even if it somehow reached the bundle.
+- **Fresh by default.** The cache lives for 24 hours, is refreshed with a
+  conditional `GET` (`ETag` / `If-Modified-Since`), and `--refresh` forces a
+  re-download. `--max-age-days N` changes the window.
+- **Provenance is recorded and shown.** `~/.cache/android-ca-updater/cacert.json`
+  stores source, URL, fetch time, `ETag` and the SHA-256 of the exact bytes
+  used; `doctor` prints them:
+
+  ```
+  ca bundle   118 roots | curl.se | 0d old | sha256 796f1389bfea13c0
+  ```
+
+- **Offline / pinned bundles.** `--bundle ./cacert.pem` skips the download and
+  validates the local file with the same rules — useful for reproducible runs
+  or air-gapped machines.
+
+The tool never edits `/system`. Roots are installed as *user* CAs through the
+platform installer, so they are always removable from Settings.
+
 ## Requirements
 
 - `python3` (3.9+), no third-party packages
@@ -66,6 +104,14 @@ android-ca-updater fix                    # install the missing roots
 android-ca-updater fix --dry-run          # show what would be installed
 android-ca-updater verify                 # re-check hosts in Chrome
 android-ca-updater list                   # every bundle root and its status
+```
+
+Bundle options (available on every command):
+
+```bash
+android-ca-updater doctor --refresh            # force a fresh download
+android-ca-updater doctor --max-age-days 7     # accept a cache up to 7 days old
+android-ca-updater doctor --bundle ./ca.pem    # validate and use a local bundle
 ```
 
 Point it at your own hosts:

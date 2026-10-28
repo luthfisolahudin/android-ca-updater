@@ -103,6 +103,33 @@ class HostParsingTests(unittest.TestCase):
         self.assertEqual(cli.parse_hosts(["a.test,a.test"]), ["a.test"])
 
 
+class BundleTrustTests(unittest.TestCase):
+    def test_rejects_plain_http_sources(self) -> None:
+        with self.assertRaises(cli.ToolError):
+            cli.assert_trusted_url("http://curl.se/ca/cacert.pem")
+
+    def test_rejects_unknown_hosts(self) -> None:
+        with self.assertRaises(cli.ToolError):
+            cli.assert_trusted_url("https://evil.example/cacert.pem")
+
+    def test_accepts_known_https_source(self) -> None:
+        cli.assert_trusted_url("https://curl.se/ca/cacert.pem")
+
+    def test_validate_flags_non_root_entries(self) -> None:
+        leaf = cli.parse_cert(cli.pem_to_der(_FIXTURES["leaf"].read_text()))
+        problems = cli.validate_bundle([leaf])
+        self.assertTrue(any("self-signed" in problem for problem in problems))
+        self.assertTrue(any("at least" in problem for problem in problems))
+
+    def test_validate_rejects_empty_bundle(self) -> None:
+        self.assertTrue(cli.validate_bundle([]))
+
+    def test_validate_only_complains_about_size_for_a_single_root(self) -> None:
+        ca = cli.parse_cert(cli.pem_to_der(_FIXTURES["ca1"].read_text()))
+        problems = cli.validate_bundle([ca])
+        self.assertEqual([problem for problem in problems if "at least" not in problem], [])
+
+
 class UiParsingTests(unittest.TestCase):
     XML = (
         '<hierarchy><node class="android.widget.LinearLayout" bounds="[0,0][540,960]">'

@@ -22,6 +22,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -30,8 +32,7 @@ from pathlib import Path
 
 __version__ = "0.1.0"
 
-BUNDLE_URL = "https://curl.se/ca/cacert.pem"
-BUNDLE_MAX_AGE = timedelta(days=7)
+BUNDLE_MAX_AGE = timedelta(days=1)
 DEVICE_DIR = "/sdcard/Download/android-ca-updater"
 CERT_INSTALLER_PKG = "com.android.certinstaller"
 CERT_INSTALLER_ACTIVITY = f"{CERT_INSTALLER_PKG}/.CertInstallerMain"
@@ -94,6 +95,7 @@ def run(
         raise ToolError(f"timed out: {' '.join(cmd[:4])}") from exc
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip()
+        detail = detail.splitlines()[0] if detail else ""
         raise ToolError(f"{' '.join(cmd[:3])}: {detail[:400]}")
     return proc
 
@@ -197,49 +199,209 @@ def from_json(payload: dict) -> Cert:
 # ------------------------------------------------------------------ mozilla bundle
 
 
-def fetch_bundle(refresh: bool = False, quiet: bool = False) -> list[Cert]:
-    path = CACHE_DIR / "cacert.pem"
-    stale = True
-    if path.exists():
-        age = datetime.now(timezone.utc) - datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-        stale = age > BUNDLE_MAX_AGE
+@dataclass(frozen=True)
+class Source:
+    name: str
+    url: str
+    description: str
 
-    if refresh or stale or not path.exists():
-        if not quiet:
-            print(f"fetching CA bundle: {BUNDLE_URL}")
-        request = urllib.request.Request(BUNDLE_URL, headers={"User-Agent": f"android-ca-updater/{__version__}"})
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                write_atomic(path, response.read())
-        except OSError as exc:
-            if not path.exists():
-                raise ToolError(f"cannot download CA bundle: {exc}") from exc
-            print(f"warning: using cached CA bundle ({exc})", file=sys.stderr)
 
-    pem_text = path.read_text(encoding="utf-8", errors="replace")
+CA_SOURCES = (
+    Source(
+        name="curl.se",
+        url="https://curl.se/ca/cacert.pem",
+        description="Mozilla NSS certdata, published by the curl project",
+    ),
+    Source(
+        name="certifi",
+        url="https://raw.githubusercontent.com/certifi/python-certifi/master/certifi/cacert.pem",
+        description="Mozilla NSS certdata, published by python-certifi",
+    ),
+)
+TRUSTED_HOSTS = frozenset({"curl.se", "raw.githubusercontent.com"})
+MIN_ROOTS = 50
+
+
+@dataclass
+class Bundle:
+    certs: list[Cert]
+    origin: str
+    fetched_at: datetime | None
+    sha256: str
+
+    def __len__(self) -> int:
+        return len(self.certs)
+
+    def age(self) -> str:
+        if self.fetched_at is None:
+            return "unknown"
+        delta = datetime.now(timezone.utc) - self.fetched_at
+        if delta < timedelta(hours=1):
+            return f"{delta.seconds // 60}m old"
+        if delta < timedelta(days=1):
+            return f"{delta.seconds // 3600}h old"
+        return f"{delta.days}d old"
+
+
+def assert_trusted_url(url: str) -> None:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in TRUSTED_HOSTS:
+        raise ToolError(f"refusing to download CA bundle from an untrusted URL: {url}")
+
+
+def http_get(url: str, etag: str | None, last_modified: str | None) -> tuple[bytes | None, dict[str, str]]:
+    assert_trusted_url(url)
+    headers = {"User-Agent": f"android-ca-updater/{__version__}"}
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read(), dict(response.headers)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return None, {}
+        raise
+
+
+def validate_bundle(certs: list[Cert]) -> list[str]:
+    problems: list[str] = []
+    if len(certs) < MIN_ROOTS:
+        problems.append(f"only {len(certs)} roots, expected at least {MIN_ROOTS}")
+    if not certs:
+        return problems or ["empty bundle"]
+    not_self_signed = [cert for cert in certs if cert.subject != cert.issuer]
+    if not_self_signed:
+        problems.append(f"{len(not_self_signed)} certificate(s) are not self-signed roots")
+    fingerprints = [cert.fingerprint for cert in certs]
+    if len(fingerprints) != len(set(fingerprints)):
+        problems.append("duplicate certificates")
+    now = datetime.now(timezone.utc)
+    expired = [cert for cert in certs if cert.not_after <= now]
+    if expired:
+        problems.append(f"{len(expired)} expired root(s)")
+    return problems
+
+
+def split_bundle(pem_text: str) -> list[Cert]:
     cache_key = hashlib.sha256(pem_text.encode()).hexdigest()[:16]
-    cache_path = CACHE_DIR / f"bundle-{cache_key}.json"
+    cache_path = CACHE_DIR / f"parsed-{cache_key}.json"
     if cache_path.exists():
         try:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
             return [from_json(item) for item in payload]
         except (json.JSONDecodeError, KeyError):
             pass
-
-    blocks = re.findall(
-        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem_text, re.S
-    )
-    certs = [parse_cert(ssl.PEM_cert_to_DER_cert(block)) for block in blocks]
+    blocks = PEM_BLOCK.findall(pem_text)
+    if not blocks:
+        raise ToolError("bundle contains no certificates")
+    certs: list[Cert] = []
+    for block in blocks:
+        try:
+            certs.append(parse_cert(ssl.PEM_cert_to_DER_cert(block)))
+        except (ValueError, ToolError) as exc:
+            raise ToolError(f"bundle contains an unreadable certificate: {exc}") from exc
     write_atomic(cache_path, json.dumps([to_json(cert) for cert in certs]))
     return certs
 
 
-def bundle_age() -> str:
-    path = CACHE_DIR / "cacert.pem"
-    if not path.exists():
-        return "unknown"
-    age = datetime.now(timezone.utc) - datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-    return f"{age.days}d old"
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def fetch_bundle(
+    refresh: bool = False,
+    quiet: bool = False,
+    max_age: timedelta = BUNDLE_MAX_AGE,
+    local_path: Path | None = None,
+) -> Bundle:
+    if local_path is not None:
+        if not local_path.exists():
+            raise ToolError(f"bundle file not found: {local_path}")
+        pem_text = local_path.read_text(encoding="utf-8", errors="replace")
+        certs = split_bundle(pem_text)
+        problems = validate_bundle(certs)
+        if problems:
+            raise ToolError(f"{local_path} is not a usable CA bundle: {', '.join(problems)}")
+        return Bundle(
+            certs=certs,
+            origin=str(local_path),
+            fetched_at=datetime.fromtimestamp(local_path.stat().st_mtime, timezone.utc),
+            sha256=hashlib.sha256(pem_text.encode()).hexdigest(),
+        )
+
+    pem_path = CACHE_DIR / "cacert.pem"
+    meta_path = CACHE_DIR / "cacert.json"
+    meta: dict = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            meta = {}
+
+    cached_at = parse_timestamp(meta.get("fetched_at"))
+    is_fresh = cached_at is not None and datetime.now(timezone.utc) - cached_at < max_age
+
+    if refresh or not is_fresh or not pem_path.exists():
+        for source in CA_SOURCES:
+            try:
+                body, headers = http_get(source.url, meta.get("etag"), meta.get("last_modified"))
+            except (OSError, urllib.error.URLError) as exc:
+                if not quiet:
+                    print(f"warning: {source.name} unavailable ({exc})", file=sys.stderr)
+                continue
+            if body is None:
+                meta["fetched_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                write_atomic(meta_path, json.dumps(meta, indent=2))
+                if not quiet:
+                    print(f"CA bundle unchanged ({source.name}, not modified)")
+                break
+            text = body.decode("utf-8", "replace")
+            try:
+                certs = split_bundle(text)
+            except ToolError as exc:
+                if not quiet:
+                    print(f"warning: rejected {source.name} bundle: {exc}", file=sys.stderr)
+                continue
+            problems = validate_bundle(certs)
+            if problems:
+                if not quiet:
+                    print(f"warning: rejected {source.name} bundle: {', '.join(problems)}", file=sys.stderr)
+                continue
+            write_atomic(pem_path, text)
+            meta = {
+                "source": source.name,
+                "url": source.url,
+                "description": source.description,
+                "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "etag": headers.get("ETag"),
+                "last_modified": headers.get("Last-Modified"),
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+            }
+            write_atomic(meta_path, json.dumps(meta, indent=2))
+            if not quiet:
+                print(f"CA bundle updated from {source.name}: {len(certs)} roots")
+            break
+
+    if not pem_path.exists():
+        raise ToolError("cannot obtain a CA bundle and no cached copy exists")
+
+    pem_text = pem_path.read_text(encoding="utf-8", errors="replace")
+    certs = split_bundle(pem_text)
+    return Bundle(
+        certs=certs,
+        origin=meta.get("source", "cache"),
+        fetched_at=parse_timestamp(meta.get("fetched_at")),
+        sha256=hashlib.sha256(pem_text.encode()).hexdigest(),
+    )
+
 
 
 # --------------------------------------------------------------------------- chains
@@ -567,6 +729,8 @@ def safe_cert_name(name: str) -> str:
 
 
 def install_root(dev: Device, cert: Cert, name: str, dry_run: bool = False) -> None:
+    if cert.subject != cert.issuer:
+        raise ToolError(f"refusing to install {cert.common_name}: not a self-signed root")
     if dry_run:
         return
     dev.ensure_unlocked()
@@ -733,16 +897,23 @@ def print_device(dev: Device, store: StoreIndex | None, tracked: dict[str, str])
 def cmd_doctor(args) -> int:
     adb = find_adb()
     dev = pick_device(adb, args.serial)
-    bundle = fetch_bundle(refresh=args.refresh)
+    bundle = fetch_bundle(
+        refresh=args.refresh,
+        max_age=timedelta(days=args.max_age_days),
+        local_path=Path(args.bundle) if args.bundle else None,
+    )
     store = load_system_store(dev)
     tracked = tracked_roots(dev.serial)
     hosts = parse_hosts(args.hosts) if args.hosts else list(DEFAULT_HOSTS)
 
     print_device(dev, store, tracked)
-    print(f"ca bundle   {len(bundle)} roots | {bundle_age()}")
+    print(
+        f"ca bundle   {len(bundle)} roots | {bundle.origin} | {bundle.age()} "
+        f"| sha256 {bundle.sha256[:16]}"
+    )
     print()
 
-    results = [analyse_host(host, bundle, store, tracked) for host in hosts]
+    results = [analyse_host(host, bundle.certs, store, tracked) for host in hosts]
 
     if args.browser:
         for result in results:
@@ -787,19 +958,23 @@ def cmd_doctor(args) -> int:
 def cmd_fix(args) -> int:
     adb = find_adb()
     dev = pick_device(adb, args.serial)
-    bundle = fetch_bundle(refresh=args.refresh)
+    bundle = fetch_bundle(
+        refresh=args.refresh,
+        max_age=timedelta(days=args.max_age_days),
+        local_path=Path(args.bundle) if args.bundle else None,
+    )
     store = load_system_store(dev)
     tracked = tracked_roots(dev.serial)
 
     if args.all_missing:
         targets = {
             cert.fingerprint: cert
-            for cert in bundle
+            for cert in bundle.certs
             if (store is None or not store.has(cert)) and cert.fingerprint not in tracked
         }
     else:
         hosts = parse_hosts(args.hosts) if args.hosts else list(DEFAULT_HOSTS)
-        results = [analyse_host(host, bundle, store, tracked) for host in hosts]
+        results = [analyse_host(host, bundle.certs, store, tracked) for host in hosts]
         if args.browser and not dev.is_locked():
             for result in results:
                 if result.source != "missing":
@@ -883,11 +1058,16 @@ def cmd_verify(args) -> int:
 def cmd_list(args) -> int:
     adb = find_adb()
     dev = pick_device(adb, args.serial)
-    bundle = fetch_bundle(refresh=args.refresh, quiet=True)
+    bundle = fetch_bundle(
+        refresh=args.refresh,
+        quiet=True,
+        max_age=timedelta(days=args.max_age_days),
+        local_path=Path(args.bundle) if args.bundle else None,
+    )
     store = load_system_store(dev)
     tracked = tracked_roots(dev.serial)
 
-    for cert in sorted(bundle, key=lambda item: item.common_name.lower()):
+    for cert in sorted(bundle.certs, key=lambda item: item.common_name.lower()):
         if store is not None and store.has(cert):
             state = "system"
         elif cert.fingerprint in tracked:
@@ -921,6 +1101,18 @@ def build_parser() -> argparse.ArgumentParser:
     def add_common(sub: argparse.ArgumentParser) -> None:
         sub.add_argument("--serial", help="adb device serial (required if several are connected)")
         sub.add_argument("--refresh", action="store_true", help="re-download the CA bundle")
+        sub.add_argument(
+            "--max-age-days",
+            type=float,
+            default=BUNDLE_MAX_AGE.days,
+            metavar="N",
+            help=f"re-download the CA bundle after N days (default {BUNDLE_MAX_AGE.days})",
+        )
+        sub.add_argument(
+            "--bundle",
+            metavar="PATH",
+            help="use a local CA bundle file instead of downloading one",
+        )
         sub.add_argument(
             "--hosts",
             nargs="+",
