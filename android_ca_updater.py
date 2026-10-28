@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 BUNDLE_MAX_AGE = timedelta(days=1)
 DEVICE_DIR = "/sdcard/Download/android-ca-updater"
@@ -1251,6 +1251,7 @@ def cmd_fix(args) -> int:
         local_path=Path(args.bundle) if args.bundle else None,
     )
     store = load_system_store(dev)
+    reconcile_tracked(dev)
     tracked = tracked_roots(dev.serial)
 
     if args.all_missing:
@@ -1362,8 +1363,12 @@ def cmd_verify(args) -> int:
     return 0
 
 
-CREDENTIAL_ACTIVITY = "com.android.settings/.TrustedCredentialsSettings"
+CREDENTIAL_ACTIVITIES = (
+    "com.android.settings/.Settings$TrustedCredentialsSettingsActivity",
+    "com.android.settings/.TrustedCredentialsSettings",
+)
 SECURITY_SETTINGS_ACTION = "android.settings.SECURITY_SETTINGS"
+USER_TAB_LABELS = ("pengguna", "user")
 CREDENTIAL_LABELS = (
     "trusted credentials",
     "kredensial tepercaya",
@@ -1386,6 +1391,15 @@ def find_node_by_text(root: ET.Element | None, needles: tuple[str, ...]) -> ET.E
     return None
 
 
+def find_node_exact(root: ET.Element | None, labels: tuple[str, ...]) -> ET.Element | None:
+    if root is None:
+        return None
+    for node in root.iter("node"):
+        if (node.get("text") or "").strip().lower() in labels:
+            return node
+    return None
+
+
 def tap_node(dev: Device, node: ET.Element | None, what: str) -> None:
     if node is None:
         raise ToolError(f"cannot find {what} on screen")
@@ -1396,8 +1410,10 @@ def tap_node(dev: Device, node: ET.Element | None, what: str) -> None:
 
 
 def open_credential_manager(dev: Device) -> None:
-    started = dev.shell(f"am start -n {CREDENTIAL_ACTIVITY}")
-    if "does not exist" not in started and "Error" not in started:
+    for activity in CREDENTIAL_ACTIVITIES:
+        started = dev.shell(f"am start -S -n '{activity}'")
+        if "does not exist" in started or "Error" in started:
+            continue
         if wait_for(lambda: "com.android.settings" in current_focus(dev), timeout=10):
             return
     dev.shell(f"am start -a {SECURITY_SETTINGS_ACTION}")
@@ -1413,9 +1429,42 @@ def open_credential_manager(dev: Device) -> None:
     time.sleep(1.2)
 
 
+def select_user_tab(dev: Device) -> None:
+    tab = find_node_exact(ui_dump(dev), USER_TAB_LABELS)
+    if tab is not None:
+        tap_node(dev, tab, "the user certificate tab")
+        time.sleep(1.0)
+
+
+def user_ca_names(dev: Device) -> set[str] | None:
+    """Names currently listed under the user tab, or None if unavailable."""
+    if dev.is_locked():
+        return None
+    try:
+        open_credential_manager(dev)
+        select_user_tab(dev)
+        dump = ui_dump(dev)
+    except ToolError:
+        return None
+    if dump is None:
+        return None
+    return {(node.get("text") or "").strip() for node in dump.iter("node")}
+
+
+def reconcile_tracked(dev: Device) -> None:
+    names = user_ca_names(dev)
+    if names is None:
+        return
+    for fingerprint, info in tracked_roots(dev.serial).items():
+        name = info.get("name")
+        if name and name not in names:
+            untrack_root(dev.serial, fingerprint)
+
+
 def remove_user_ca(dev: Device, name: str) -> None:
     dev.ensure_unlocked()
     open_credential_manager(dev)
+    select_user_tab(dev)
 
     target = find_node_by_text(ui_dump(dev), (name.lower(),))
     if target is None:
@@ -1429,7 +1478,7 @@ def remove_user_ca(dev: Device, name: str) -> None:
     tap_node(dev, confirm, "the remove button")
     time.sleep(1.0)
 
-    final = find_node(ui_dump(dev), class_name="Button", labels=OK_LABELS + REMOVE_LABELS)
+    final = find_node(ui_dump(dev), class_name="Button", labels=OK_LABELS)
     if final is not None:
         tap_node(dev, final, "the confirmation button")
         time.sleep(1.0)

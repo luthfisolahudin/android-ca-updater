@@ -110,7 +110,7 @@ Two hard limits, stated plainly:
   `cacerts-removed` directory is root-only. `audit` reports them; removing them
   needs root, a custom ROM, or a supported device.
 - **Only user CAs can be revoked.** `revoke` removes the roots this tool
-  installed, through the device's own trusted-credentials screen:
+  installed through the device's own trusted-credentials screen:
 
 ```bash
 android-ca-updater revoke --stale            # roots now distrusted/expired/removed
@@ -118,12 +118,25 @@ android-ca-updater revoke --name ISRG        # match by name
 android-ca-updater revoke --stale --dry-run
 ```
 
-`revoke` needs the ROM to expose a trusted-credentials screen
-(`com.android.settings/.TrustedCredentialsSettings`, or Settings > Security). If
-it cannot find one, it stops and prints the manual path instead of guessing.
+`revoke` restarts the credentials screen (so the list is never a cached view),
+switches to the *User* tab, opens the certificate, taps remove, and checks that
+the entry is gone afterwards. It tries both activity names used across Android
+versions:
+
+- `com.android.settings/.Settings$TrustedCredentialsSettingsActivity` (Android 6)
+- `com.android.settings/.TrustedCredentialsSettings` (Android 7+)
+
+and falls back to Settings > Security if neither opens. If the ROM has no
+certificate-management screen at all, it stops and prints the manual path
+instead of guessing.
+
+`fix` reconciles its state with the device: if a root it installed was removed
+by hand, the next run notices and reinstalls it rather than assuming it is
+still there.
 
 `fix` also refuses to install anything that is not a self-signed root from the
-current bundle, so a compromised or injected entry never reaches the device.
+current bundle, and skips roots Mozilla has distrusted, so a compromised entry
+never reaches the device.
 
 ## Requirements
 
