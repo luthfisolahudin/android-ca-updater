@@ -140,7 +140,7 @@ never reaches the device.
 
 ## Requirements
 
-- `python3` (3.9+), no third-party packages
+- `python3` (3.13+), no third-party packages
 - `openssl` in `PATH`
 - `adb` in `PATH` (or `adb` from the Android SDK at the usual locations, or `$ADB`)
 - a device with USB debugging enabled and a screen lock set (Android requires
@@ -152,11 +152,11 @@ never reaches the device.
 git clone https://github.com/luthfisolahudin/android-ca-updater.git
 cd android-ca-updater
 
-# run it directly
-./android_ca_updater.py doctor
+# run it straight from the checkout
+uv run android-ca-updater doctor
 
 # or install the `android-ca-updater` command
-pipx install .
+uv tool install .
 ```
 
 ## Usage
@@ -227,12 +227,15 @@ run: android-ca-updater fix
   (or confirmed with `doctor --browser`, which shows `ok?`).
 - Everything the tool installs is recorded in
   `~/.local/state/android-ca-updater/state.json`.
-- The CA bundle is cached for 7 days; `--refresh` forces a fresh download.
+- The CA bundle is cached for 24 hours; `--refresh` forces a fresh download.
 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v
+uv sync
+uv run pytest --cov
+uv run ruff check . && uv run ruff format --check .
+uv run mypy
 ```
 
 ## License
