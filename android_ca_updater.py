@@ -676,14 +676,25 @@ def track_root(serial: str, cert: Cert, name: str) -> None:
 
 
 def ui_dump(dev: Device) -> ET.Element | None:
-    dev.shell(f"uiautomator dump {UI_DUMP_PATH}", timeout=120)
-    payload = dev.shell(f"cat {UI_DUMP_PATH}", timeout=60)
+    dev.shell(f"rm -f {UI_DUMP_PATH}", timeout=30)
+    try:
+        dev.shell(f"uiautomator dump {UI_DUMP_PATH}", timeout=120)
+        payload = dev.shell(f"cat {UI_DUMP_PATH}", timeout=60)
+    except ToolError:
+        return None
     if "hierarchy" not in payload:
         return None
     try:
         return ET.fromstring(payload)
     except ET.ParseError:
         return None
+
+
+def ime_visible(dev: Device) -> bool:
+    try:
+        return "mInputShown=true" in dev.shell("dumpsys input_method", timeout=30)
+    except ToolError:
+        return False
 
 
 def node_bounds(node: ET.Element) -> tuple[int, int] | None:
@@ -762,13 +773,27 @@ def install_root(dev: Device, cert: Cert, name: str, dry_run: bool = False) -> N
     field = find_node(dump, class_name="EditText")
     if field is not None:
         center = node_bounds(field)
-        if center:
-            dev.shell(f"input tap {center[0]} {center[1]}")
-            time.sleep(0.4)
-            dev.shell(f'input text "{safe_cert_name(name).replace(" ", "%s")}"')
-            time.sleep(0.3)
-            dev.shell("input keyevent 4")
-            time.sleep(0.6)
+        if center is None:
+            raise ToolError("cannot locate the certificate name field")
+        dev.shell(f"input tap {center[0]} {center[1]}")
+        wait_for(lambda: ime_visible(dev), timeout=6)
+        typed_name = safe_cert_name(name)
+        entry = None
+        for _ in range(3):
+            dev.shell(f'input text "{typed_name.replace(" ", "%s")}"')
+            time.sleep(0.5)
+            dump = ui_dump(dev)
+            if dump is None:
+                raise ToolError("certificate dialog closed while entering the name")
+            entry = find_node(dump, class_name="EditText")
+            if entry is not None and (entry.get("text") or "").strip():
+                break
+        if entry is None or not (entry.get("text") or "").strip():
+            raise ToolError("could not type a certificate name into the installer")
+        dev.shell("input keyevent 4")
+        time.sleep(0.8)
+        if CERT_INSTALLER_PKG not in current_focus(dev):
+            raise ToolError("certificate dialog closed while entering the name")
         dump = ui_dump(dev)
         if dump is None:
             raise ToolError("certificate dialog closed unexpectedly")
@@ -781,7 +806,12 @@ def install_root(dev: Device, cert: Cert, name: str, dry_run: bool = False) -> N
         dev.shell(f"input tap {center[0]} {center[1]}")
 
     if not wait_for(lambda: CERT_INSTALLER_PKG not in current_focus(dev), timeout=25):
-        raise ToolError("certificate installer did not finish (does the device already trust it?)")
+        leftover = ui_dump(dev)
+        visible = ""
+        if leftover is not None:
+            visible = " ".join(node.get("text") or "" for node in leftover.iter("node")).strip()
+        suffix = f": {visible[:160]}" if visible else ""
+        raise ToolError(f"certificate installer did not finish{suffix}")
     track_root(dev.serial, cert, safe_cert_name(name))
 
 
