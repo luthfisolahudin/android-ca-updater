@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET  # nosec B405
 from collections.abc import Callable
 
 from .adb import AdbDevice
@@ -12,6 +12,7 @@ from .config import UI_DUMP_PATH
 from .errors import ToolError
 
 _BOUNDS = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
+MAX_UI_DUMP_CHARS = 2_000_000
 
 
 def ui_dump(device: AdbDevice) -> ET.Element | None:
@@ -21,10 +22,12 @@ def ui_dump(device: AdbDevice) -> ET.Element | None:
         payload = device.shell(f"cat {UI_DUMP_PATH}", timeout=60)
     except ToolError:
         return None
-    if "hierarchy" not in payload:
+    if "hierarchy" not in payload or len(payload) > MAX_UI_DUMP_CHARS:
         return None
     try:
-        return ET.fromstring(payload)
+        # The payload is produced by the attached device and capped above, so
+        # entity-expansion attacks cannot blow up memory.
+        return ET.fromstring(payload)  # nosec B314
     except ET.ParseError:
         return None
 

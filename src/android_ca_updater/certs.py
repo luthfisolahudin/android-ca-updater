@@ -38,7 +38,9 @@ class Cert:
 
     @property
     def sha1(self) -> str:
-        return hashlib.sha1(self.der).hexdigest()
+        # Mozilla's certdata is keyed by SHA-1 fingerprints: an identifier,
+        # not a security primitive.
+        return hashlib.sha1(self.der, usedforsecurity=False).hexdigest()
 
     @property
     def pem(self) -> bytes:

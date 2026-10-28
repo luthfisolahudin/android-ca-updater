@@ -40,25 +40,29 @@ add arbitrary or self-signed certificates.
 
 The bundle is *Mozilla's* trust store, not a list maintained by this project:
 
-| Order | Source | What it is |
-| --- | --- | --- |
-| 1 | `https://curl.se/ca/cacert.pem` | Mozilla NSS `certdata.txt`, published by the curl project |
-| 2 | `https://raw.githubusercontent.com/certifi/python-certifi/master/certifi/cacert.pem` | The same Mozilla data, published by python-certifi |
+| Order | Source                                                                               | What it is                                                |
+| ----- | ------------------------------------------------------------------------------------ | --------------------------------------------------------- |
+| 1     | `https://curl.se/ca/cacert.pem`                                                      | Mozilla NSS `certdata.txt`, published by the curl project |
+| 2     | `https://raw.githubusercontent.com/certifi/python-certifi/master/certifi/cacert.pem` | The same Mozilla data, published by python-certifi        |
 
 Guarantees enforced in code:
 
 - **HTTPS only, hostname allowlisted.** `assert_trusted_url()` rejects any
   other scheme or host, so a tampered `CA_SOURCES` entry cannot downgrade to
   plain HTTP or an arbitrary mirror.
+
 - **Every download is validated before use.** A bundle is rejected unless it
   contains at least 50 roots, every entry is a self-signed root (subject ==
   issuer), there are no duplicates, and no root is expired. A rejected bundle
   never replaces the last valid cached copy.
+
 - **Only self-signed roots can be installed.** `install_root()` refuses
   anything else, even if it somehow reached the bundle.
+
 - **Fresh by default.** The cache lives for 24 hours, is refreshed with a
   conditional `GET` (`ETag` / `If-Modified-Since`), and `--refresh` forces a
   re-download. `--max-age-days N` changes the window.
+
 - **Provenance is recorded and shown.** `~/.cache/android-ca-updater/cacert.json`
   stores source, URL, fetch time, `ETag` and the SHA-256 of the exact bytes
   used; `doctor` prints them:
@@ -97,11 +101,11 @@ DISTRUSTED  18 root(s) - not trusted for TLS by Mozilla - highest risk
 
 Categories:
 
-| Category | Meaning |
-| --- | --- |
+| Category     | Meaning                                                                                                                                   |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `distrusted` | Mozilla does not trust this root for TLS: either the trust bit is not `CKT_NSS_TRUSTED_DELEGATOR` or its `distrust after` date has passed |
-| `removed` | The root is gone from Mozilla's program entirely (retired, replaced, or removed for cause) |
-| `expired` | The certificate's `notAfter` has passed; it is inert but still shipped |
+| `removed`    | The root is gone from Mozilla's program entirely (retired, replaced, or removed for cause)                                                |
+| `expired`    | The certificate's `notAfter` has passed; it is inert but still shipped                                                                    |
 
 Two hard limits, stated plainly:
 
@@ -232,11 +236,28 @@ run: android-ca-updater fix
 ## Development
 
 ```bash
-uv sync
+uv sync                 # or: mise run setup
 uv run pytest --cov
-uv run ruff check . && uv run ruff format --check .
-uv run mypy
+mise run check          # ruff, codespell, bandit, vulture, mdformat, mypy, pytest
+mise run fix            # apply ruff/codespell/mdformat fixes
 ```
+
+The toolchain is a dev-only dependency group in `pyproject.toml`:
+
+| Tool        | Role                             |
+| ----------- | -------------------------------- |
+| `ruff`      | formatter and linter             |
+| `mypy`      | strict static type checker       |
+| `bandit`    | security static analysis         |
+| `vulture`   | dead-code detection              |
+| `codespell` | typo checker                     |
+| `mdformat`  | Markdown formatter               |
+| `pip-audit` | dependency advisory audit        |
+| `prek`      | git hook runner (`prek install`) |
+
+`mise.toml` pins `uv` and enables `.python-version` through mise's idiomatic
+version files, so `mise run setup` and `uv sync` always agree on the
+interpreter.
 
 ## License
 

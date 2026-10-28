@@ -224,7 +224,7 @@ class CertdataStore:
 
 def classify_root(cert: Cert, records: dict[str, CertRecord], now: datetime | None = None) -> str:
     current = now or datetime.now(UTC)
-    record = records.get(hashlib.sha1(cert.der).hexdigest())
+    record = records.get(cert.sha1)
     if record is None:
         return "expired" if cert.not_after <= current else "removed"
     if record.server_auth != TRUSTED_FOR_TLS:

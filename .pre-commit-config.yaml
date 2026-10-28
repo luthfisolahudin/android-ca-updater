@@ -1,0 +1,38 @@
+default_install_hook_types: [pre-commit]
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: bandit
+        name: bandit
+        entry: uv run bandit -c pyproject.toml -r src
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: codespell
+        name: codespell
+        entry: uv run codespell
+        language: system
+        pass_filenames: false
+      - id: mdformat
+        name: mdformat
+        entry: uv run mdformat
+        language: system
+        types: [markdown]

@@ -77,7 +77,9 @@ class UrllibHttpClient:
             headers["If-Modified-Since"] = last_modified
         request = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            # assert_trusted_url() above pins the scheme to https and the host
+            # to the allowlist, so no file:/ or custom scheme can be reached.
+            with urllib.request.urlopen(request, timeout=30) as response:  # nosec B310
                 return response.read(), dict(response.headers)
         except urllib.error.HTTPError as exc:
             if exc.code == 304:

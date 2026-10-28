@@ -12,3 +12,5 @@ dist/
 .coverage
 .coverage.*
 htmlcov/
+mise.local.toml
+.mise.local.toml

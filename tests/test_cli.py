@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import timedelta
 
 import pytest
@@ -60,6 +62,16 @@ def test_bad_usage_exits_two(argv: list[str]) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(argv)
     assert excinfo.value.code == 2
+
+
+def test_module_entry_point() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "android_ca_updater", "--version"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert __version__ in result.stdout
 
 
 def test_doctor_reports_missing_roots(
