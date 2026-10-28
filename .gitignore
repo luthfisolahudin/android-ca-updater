@@ -4,3 +4,11 @@ build/
 dist/
 *.egg-info/
 .venv/
+
+# tooling
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
