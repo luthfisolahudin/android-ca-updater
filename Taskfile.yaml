@@ -1,0 +1,47 @@
+version: '3'
+
+tasks:
+  setup:
+    desc: Create or refresh the uv environment
+    cmds:
+      - uv sync
+
+  lint:
+    desc: Run every static check (format, lint, security, dead code, docs)
+    cmds:
+      - uv run ruff check .
+      - uv run ruff format --check .
+      - uv run codespell
+      - uv run bandit -c pyproject.toml -r src
+      - uv run vulture
+      - uv run mdformat --check README.md tests/fixtures/README.md
+
+  typecheck:
+    desc: Type-check the package with mypy
+    cmds:
+      - uv run mypy
+
+  test:
+    desc: Run the test suite with coverage
+    cmds:
+      - uv run pytest --cov
+
+  check:
+    desc: Run lint, typecheck and tests
+    cmds:
+      - task: lint
+      - task: typecheck
+      - task: test
+
+  fix:
+    desc: Apply automatic fixes
+    cmds:
+      - uv run ruff check --fix .
+      - uv run ruff format .
+      - uv run codespell --write-changes
+      - uv run mdformat README.md tests/fixtures/README.md
+
+  audit:
+    desc: Audit the environment for known vulnerabilities
+    cmds:
+      - uv run pip-audit

@@ -4,48 +4,9 @@
 # version files; uv owns the virtualenv and every Python package declared in
 # pyproject.toml.
 [tools]
-uv = "0.13"
+uv = "0.13.6"
+task = "3.54.0"
 
 [settings]
 idiomatic_version_file_enable_tools = ["python"]
 python.uv_venv_auto = true
-
-[tasks.setup]
-description = "Create or refresh the uv environment"
-run = "uv sync"
-
-[tasks.lint]
-description = "Run every static check (format, lint, security, dead code, docs)"
-run = [
-  "uv run ruff check .",
-  "uv run ruff format --check .",
-  "uv run codespell",
-  "uv run bandit -c pyproject.toml -r src",
-  "uv run vulture",
-  "uv run mdformat --check README.md tests/fixtures/README.md",
-]
-
-[tasks.typecheck]
-description = "Type-check the package with mypy"
-run = "uv run mypy"
-
-[tasks.test]
-description = "Run the test suite with coverage"
-run = "uv run pytest --cov"
-
-[tasks.check]
-description = "Run lint, typecheck and tests"
-depends = ["lint", "typecheck", "test"]
-
-[tasks.fix]
-description = "Apply automatic fixes"
-run = [
-  "uv run ruff check --fix .",
-  "uv run ruff format .",
-  "uv run codespell --write-changes",
-  "uv run mdformat README.md tests/fixtures/README.md",
-]
-
-[tasks.audit]
-description = "Audit the environment for known vulnerabilities"
-run = "uv run pip-audit"

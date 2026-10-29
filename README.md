@@ -236,10 +236,10 @@ run: android-ca-updater fix
 ## Development
 
 ```bash
-uv sync                 # or: mise run setup
+uv sync                 # or: task setup
 uv run pytest --cov
-mise run check          # ruff, codespell, bandit, vulture, mdformat, mypy, pytest
-mise run fix            # apply ruff/codespell/mdformat fixes
+task check              # ruff, codespell, bandit, vulture, mdformat, mypy, pytest
+task fix                # apply ruff/codespell/mdformat fixes
 ```
 
 The toolchain is a dev-only dependency group in `pyproject.toml`:
@@ -256,7 +256,7 @@ The toolchain is a dev-only dependency group in `pyproject.toml`:
 | `prek`      | git hook runner (`prek install`) |
 
 `mise.toml` pins `uv` and enables `.python-version` through mise's idiomatic
-version files, so `mise run setup` and `uv sync` always agree on the
+version files, so `task setup` and `uv sync` always agree on the
 interpreter.
 
 ## License
